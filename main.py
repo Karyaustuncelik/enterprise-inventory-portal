@@ -19,15 +19,15 @@ app.add_middleware(
 
 PARAM_FILTERS = {
     "country": ("[Country]", "exact"),
-    "status": ("[Status]", "exact"),
+    "status": ("[Status]", "like"),
     "name_surname": ("[Name_Surname]", "like"),
-    "identity": ("[Identity]", "exact"),
-    "department": ("[Department]", "exact"),
-    "region": ("[Region]", "exact"),
-    "hardware_type": ("[Hardware_Type]", "exact"),
-    "hardware_manufacturer": ("[Hardware_Manufacturer]", "exact"),
-    "hardware_model": ("[Hardware_Model]", "exact"),
-    "win_os": ("[Win_OS]", "exact"),
+    "identity": ("[Identity]", "like"),
+    "department": ("[Department]", "like"),
+    "region": ("[Region]", "like"),
+    "hardware_type": ("[Hardware_Type]", "like"),
+    "hardware_manufacturer": ("[Hardware_Manufacturer]", "like"),
+    "hardware_model": ("[Hardware_Model]", "like"),
+    "win_os": ("[Win_OS]", "like"),
     "user_name": ("[User_Name]", "like"),
     "old_user": ("[Old_User]", "like"),
     "windows_computer_name": ("[Windows_Computer_Name]", "like"),
@@ -113,8 +113,9 @@ def _append_filter(clauses, params, column_sql, operator, raw_value):
         clauses.append(f"{column_sql} = ?")
         params.append(value)
     elif operator == "like":
-        clauses.append(f"{column_sql} LIKE ?")
-        params.append(f"%{value}%")
+        text_value = str(value)
+        clauses.append(f"UPPER({column_sql}) LIKE ?")
+        params.append(f"%{text_value.upper()}%")
     elif operator == "number":
         try:
             numeric_value = float(value)
