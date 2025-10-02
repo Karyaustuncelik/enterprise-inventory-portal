@@ -22,7 +22,8 @@ PARAM_FILTERS = {
     "status": ("[Status]", "like"),
     "name_surname": ("[Name_Surname]", "like"),
     "identity": ("[Identity]", "like"),
-    "department": ("[Department]", "like"),
+    # Department yalnızca kod kısmına göre filtrelensin
+    "department": ("[Department]", "dept_code_like"),
     "region": ("[Region]", "like"),
     "hardware_type": ("[Hardware_Type]", "like"),
     "hardware_manufacturer": ("[Hardware_Manufacturer]", "like"),
@@ -69,7 +70,8 @@ SEARCHABLE_COLUMNS = {
     "Status": ("[Status]", "like"),
     "Name_Surname": ("[Name_Surname]", "like"),
     "Identity": ("[Identity]", "like"),
-    "Department": ("[Department]", "like"),
+    # Global column search'ta da Department kodu baz alınsın
+    "Department": ("[Department]", "dept_code_like"),
     "Region": ("[Region]", "like"),
     "Hardware_Type": ("[Hardware_Type]", "like"),
     "Hardware_Manufacturer": ("[Hardware_Manufacturer]", "like"),
@@ -112,10 +114,30 @@ def _append_filter(clauses, params, column_sql, operator, raw_value):
     if operator == "exact":
         clauses.append(f"{column_sql} = ?")
         params.append(value)
+
     elif operator == "like":
         text_value = str(value)
-        clauses.append(f"UPPER({column_sql}) LIKE ?")
+        # Trim + upper ile sağlamlaştır
+        clauses.append(f"UPPER(LTRIM(RTRIM({column_sql}))) LIKE ?")
         params.append(f"%{text_value.upper()}%")
+
+    elif operator == "dept_code_like":
+        # "HCB - Henkel Consumer Brands" -> "HCB"
+        code_expr = f"""
+            UPPER(LTRIM(RTRIM(
+                CASE
+                    WHEN CHARINDEX('-', {column_sql}) > 0
+                        THEN LEFT({column_sql}, CHARINDEX('-', {column_sql}) - 1)
+                    ELSE {column_sql}
+                END
+            )))
+        """
+        text_value = str(value).strip().upper()
+        if not text_value:
+            return
+        clauses.append(f"{code_expr} LIKE ?")
+        params.append(f"%{text_value}%")
+
     elif operator == "number":
         try:
             numeric_value = float(value)
@@ -123,15 +145,19 @@ def _append_filter(clauses, params, column_sql, operator, raw_value):
             raise HTTPException(status_code=400, detail="Invalid numeric search value.")
         clauses.append(f"{column_sql} = ?")
         params.append(numeric_value)
+
     elif operator == "date_gte":
         clauses.append(f"{column_sql} >= TRY_CONVERT(date, ?, 23)")
         params.append(value)
+
     elif operator == "date_lte":
         clauses.append(f"{column_sql} <= TRY_CONVERT(date, ?, 23)")
         params.append(value)
+
     elif operator == "date_like":
         clauses.append(f"CONVERT(varchar(10), {column_sql}, 23) LIKE ?")
         params.append(f"%{value}%")
+
     else:
         raise HTTPException(status_code=400, detail="Unsupported filter operator.")
 
@@ -146,7 +172,7 @@ def _normalise_country_code(value: Optional[str]) -> Optional[str]:
     return str(value).strip().upper()
 
 # -----------------------------
-# server ve db ayakta m?
+# server ve db ayakta mı?
 # -----------------------------
 @app.get("/health")
 def health():
@@ -165,7 +191,7 @@ def count_all():
     return {"total": total}
 
 # -----------------------------
-# Yeni kay?t olu?turma (POST)
+# Yeni kayıt oluşturma (POST)
 # -----------------------------
 class HardwareCreate(BaseModel):
     Country: str = Field(..., min_length=2, max_length=2)
@@ -250,7 +276,7 @@ def create_item(payload: HardwareCreate):
             return {"ok": False, "error": str(e), "params": params}
 
 # -------------------------------------------
-# ?lke baz?nda spare oranlar?
+# Ülke bazında spare oranları
 # -------------------------------------------
 @app.get("/spare_ratios")
 def spare_ratios():
