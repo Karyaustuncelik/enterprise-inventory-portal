@@ -18,7 +18,7 @@ app.add_middleware(
 )
 
 PARAM_FILTERS = {
-    "country": ("[Country]", "exact"),
+    "country": ("[Country]", "like"),
     "status": ("[Status]", "like"),
     "name_surname": ("[Name_Surname]", "like"),
     "identity": ("[Identity]", "like"),
@@ -434,4 +434,3 @@ def rows(
         "offset": int(offset),
         "count": total_count,
     }
-
