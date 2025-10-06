@@ -1,7 +1,7 @@
 # main.py
 
 from fastapi import FastAPI, Query, HTTPException
-from typing import Optional, Union
+from typing import Optional, Union, List, Dict
 from pydantic import BaseModel, Field, field_validator
 from database import get_conn
 from datetime import date
@@ -99,6 +99,132 @@ SEARCHABLE_COLUMN_LOOKUP.update(
     }
 )
 
+CHOICE_FIELDS = [
+    "Country",
+    "Department",
+    "Hardware_Manufacturer",
+    "Hardware_Model",
+    "Hardware_Type",
+    "Identity",
+    "Location_Floor",
+    "Region",
+    "Status",
+    "Win_OS",
+]
+
+CHOICE_FIELD_LOOKUP = {field.lower(): field for field in CHOICE_FIELDS}
+FIELD_PARAM_COLUMN_SQL = {
+    "Country": "[Country]",
+    "Department": "[Department]",
+    "Hardware_Manufacturer": "[Hardware_Manufacturer]",
+    "Hardware_Model": "[Hardware_Model]",
+    "Hardware_Type": "[Hardware_Type]",
+    "Identity": "[Identity]",
+    "Location_Floor": "[Location/Floor]",
+    "Region": "[Region]",
+    "Status": "[Status]",
+    "Win_OS": "[Win_OS]",
+}
+
+
+class FieldParamItem(BaseModel):
+    value: str
+    usage_count: int
+    managed: bool = True
+
+
+class FieldParametersResponse(BaseModel):
+    fields: Dict[str, List[FieldParamItem]]
+
+
+class FieldParamCreate(BaseModel):
+    value: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("value")
+    def normalise_value(cls, v: str) -> str:
+        value = (v or "").strip()
+        if not value:
+            raise ValueError("Value cannot be empty.")
+        return value
+
+
+class FieldParamUpdate(BaseModel):
+    original: str = Field(..., min_length=1, max_length=255)
+    value: str = Field(..., min_length=1, max_length=255)
+    update_existing: bool = True
+
+    @field_validator("original", "value")
+    def normalise_update_values(cls, v: str) -> str:
+        value = (v or "").strip()
+        if not value:
+            raise ValueError("Value cannot be empty.")
+        return value
+
+
+def _ensure_choice_field(field: str) -> str:
+    if not field:
+        raise HTTPException(status_code=404, detail="Field name is required.")
+    key = field.strip().lower()
+    canonical = CHOICE_FIELD_LOOKUP.get(key)
+    if not canonical:
+        raise HTTPException(status_code=404, detail=f"Unsupported field '{field}'.")
+    return canonical
+
+
+def _normalise_param_value(value: str) -> str:
+    trimmed = (value or "").strip()
+    if not trimmed:
+        raise HTTPException(status_code=400, detail="Value cannot be empty.")
+    return trimmed
+
+
+def _field_column_sql(field: str) -> str:
+    try:
+        return FIELD_PARAM_COLUMN_SQL[field]
+    except KeyError as exc:
+        raise HTTPException(status_code=500, detail=f"Missing column mapping for field '{field}'.") from exc
+
+
+def _get_usage_count(conn, field: str, value: str) -> int:
+    column_sql = _field_column_sql(field)
+    trim_expr = f"LTRIM(RTRIM({column_sql}))"
+    cur = conn.cursor()
+    cur.execute(f"SELECT COUNT(*) FROM [dbo].[ITHardware] WHERE {trim_expr} = ?", value)
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def _fetch_field_params(conn, field: str) -> List[Dict[str, object]]:
+    canonical = _ensure_choice_field(field)
+    column_sql = _field_column_sql(canonical)
+    managed_values: List[str] = []
+    cur = conn.cursor()
+    cur.execute("SELECT ParamName FROM FieldParams WHERE FieldName = ? ORDER BY ParamName ASC", canonical)
+    for (raw_value,) in cur.fetchall():
+        value = (raw_value or "").strip()
+        if value and value not in managed_values:
+            managed_values.append(value)
+    trim_expr = f"LTRIM(RTRIM({column_sql}))"
+    usage_counts: Dict[str, int] = {}
+    cur.execute(f"SELECT {trim_expr} AS ParamValue, COUNT(*) FROM [dbo].[ITHardware] GROUP BY {trim_expr}")
+    for raw_value, count in cur.fetchall():
+        value = (raw_value or "").strip()
+        if not value:
+            continue
+        usage_counts[value] = int(count)
+    items: List[Dict[str, object]] = []
+    seen = set()
+    for value in managed_values:
+        usage = usage_counts.get(value, 0)
+        items.append({"value": value, "usage_count": usage, "managed": True})
+        seen.add(value)
+    for value, usage in usage_counts.items():
+        if value not in seen:
+            items.append({"value": value, "usage_count": usage, "managed": False})
+    items.sort(key=lambda item: (0 if item.get("managed") else 1, item["value"].lower()))
+    return items
+
+
 def _append_filter(clauses, params, column_sql, operator, raw_value):
     if raw_value is None:
         return
@@ -189,6 +315,162 @@ def count_all():
         cur.execute("SELECT COUNT(*) FROM [dbo].[ITHardware]")
         total = cur.fetchone()[0]
     return {"total": total}
+
+@app.get("/field-parameters", response_model=FieldParametersResponse)
+def list_field_parameters():
+    with get_conn() as conn:
+        fields = {field: _fetch_field_params(conn, field) for field in CHOICE_FIELDS}
+    return {"fields": fields}
+
+
+@app.get("/field-parameters/{field}", response_model=List[FieldParamItem])
+def get_field_parameters(field: str):
+    canonical = _ensure_choice_field(field)
+    with get_conn() as conn:
+        return _fetch_field_params(conn, canonical)
+
+
+@app.post("/field-parameters/{field}", response_model=FieldParamItem, status_code=201)
+def create_field_parameter(field: str, payload: FieldParamCreate):
+    canonical = _ensure_choice_field(field)
+    value = payload.value
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM FieldParams WHERE FieldName = ? AND UPPER(LTRIM(RTRIM(ParamName))) = UPPER(?)",
+            canonical,
+            value,
+        )
+        if cur.fetchone():
+            raise HTTPException(status_code=409, detail="This value already exists for the selected field.")
+        cur.execute("INSERT INTO FieldParams (FieldName, ParamName) VALUES (?, ?)", canonical, value)
+        conn.commit()
+        usage_count = _get_usage_count(conn, canonical, value)
+    return {"value": value, "usage_count": usage_count, "managed": True}
+
+
+@app.put("/field-parameters/{field}", response_model=FieldParamItem)
+def update_field_parameter(field: str, payload: FieldParamUpdate):
+    canonical = _ensure_choice_field(field)
+    original = payload.original
+    new_value = payload.value
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT ParamName FROM FieldParams WHERE FieldName = ? AND RTRIM(LTRIM(ParamName)) = ?",
+            canonical,
+            original,
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="The specified value was not found.")
+        stored_original = row[0]
+        if new_value.lower() != original.lower():
+            cur.execute(
+                "SELECT 1 FROM FieldParams WHERE FieldName = ? AND UPPER(LTRIM(RTRIM(ParamName))) = UPPER(?)",
+                canonical,
+                new_value,
+            )
+            existing = cur.fetchone()
+            if existing:
+                raise HTTPException(status_code=409, detail="Another parameter already uses this value.")
+        cur.execute(
+            "UPDATE FieldParams SET ParamName = ? WHERE FieldName = ? AND ParamName = ?",
+            new_value,
+            canonical,
+            stored_original,
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Value update failed.")
+        if payload.update_existing and new_value.lower() != original.lower():
+            column_sql = _field_column_sql(canonical)
+            trim_expr = f"LTRIM(RTRIM({column_sql}))"
+            cur.execute(
+                f"UPDATE [dbo].[ITHardware] SET {column_sql} = ? WHERE {trim_expr} = ?",
+                new_value,
+                stored_original.strip(),
+            )
+        conn.commit()
+        usage_count = _get_usage_count(conn, canonical, new_value)
+    return {"value": new_value, "usage_count": usage_count, "managed": True}
+
+
+@app.delete("/field-parameters/{field}/{value}")
+def delete_field_parameter(
+    field: str,
+    value: str,
+    force: bool = Query(False),
+    replacement: Optional[str] = Query(None),
+):
+    canonical = _ensure_choice_field(field)
+    target_value = _normalise_param_value(value)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT ParamName FROM FieldParams WHERE FieldName = ? AND RTRIM(LTRIM(ParamName)) = ?",
+            canonical,
+            target_value,
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Value not found.")
+        stored_value = row[0]
+        usage_count = _get_usage_count(conn, canonical, stored_value.strip())
+        applied_replacement: Optional[str] = None
+        column_sql = _field_column_sql(canonical)
+        trim_expr = f"LTRIM(RTRIM({column_sql}))"
+        affected = 0
+        if usage_count > 0:
+            if replacement:
+                replacement_value = _normalise_param_value(replacement)
+                cur.execute(
+                    "SELECT ParamName FROM FieldParams WHERE FieldName = ? AND RTRIM(LTRIM(ParamName)) = ?",
+                    canonical,
+                    replacement_value,
+                )
+                rep_row = cur.fetchone()
+                if not rep_row:
+                    raise HTTPException(status_code=404, detail="Replacement value is not registered.")
+                applied_replacement = rep_row[0].strip()
+                if applied_replacement.lower() == stored_value.strip().lower():
+                    raise HTTPException(status_code=400, detail="Replacement must be different from the removed value.")
+                cur.execute(
+                    f"UPDATE [dbo].[ITHardware] SET {column_sql} = ? WHERE {trim_expr} = ?",
+                    applied_replacement,
+                    stored_value.strip(),
+                )
+                affected = cur.rowcount
+            elif force:
+                cur.execute(
+                    f"UPDATE [dbo].[ITHardware] SET {column_sql} = NULL WHERE {trim_expr} = ?",
+                    stored_value.strip(),
+                )
+                affected = cur.rowcount
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": f"Cannot delete '{stored_value.strip()}' while it is used in {usage_count} records.",
+                        "usage_count": usage_count,
+                        "requires_replacement": True,
+                    },
+                )
+        cur.execute(
+            "DELETE FROM FieldParams WHERE FieldName = ? AND ParamName = ?",
+            canonical,
+            stored_value,
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Deletion failed.")
+        conn.commit()
+    return {
+        "value": stored_value.strip(),
+        "removed": True,
+        "affected_records": affected,
+        "replacement": applied_replacement,
+        "usage_before": usage_count,
+    }
+
 
 # -----------------------------
 # Yeni kayıt oluşturma (POST)
