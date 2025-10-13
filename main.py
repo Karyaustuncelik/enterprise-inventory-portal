@@ -17,6 +17,141 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _clean_text(value, upper: bool = False):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text.upper() if upper else text
+
+
+def _clean_date(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_flag(value) -> int:
+    if value in (1, "1", True, "true", "True"):
+        return 1
+    return 0
+
+
+def _prepare_payload_dict(payload):
+    return {
+        "Country": _clean_text(getattr(payload, "Country", None), upper=True),
+        "Status": _clean_text(getattr(payload, "Status", None)),
+        "Name_Surname": _clean_text(getattr(payload, "Name_Surname", None)),
+        "Identity": _clean_text(getattr(payload, "Identity", None)),
+        "Department": _clean_text(getattr(payload, "Department", None)),
+        "Region": _clean_text(getattr(payload, "Region", None)),
+        "Hardware_Type": _clean_text(getattr(payload, "Hardware_Type", None)),
+        "Hardware_Manufacturer": _clean_text(getattr(payload, "Hardware_Manufacturer", None)),
+        "Hardware_Model": _clean_text(getattr(payload, "Hardware_Model", None)),
+        "Hardware_Serial_Number": _clean_text(getattr(payload, "Hardware_Serial_Number", None)),
+        "Asset_Number": _clean_text(getattr(payload, "Asset_Number", None)),
+        "Capitalization_Date": _clean_date(getattr(payload, "Capitalization_Date", None)),
+        "User_Name": _clean_text(getattr(payload, "User_Name", None)),
+        "Old_User": _clean_text(getattr(payload, "Old_User", None)),
+        "Windows_Computer_Name": _clean_text(getattr(payload, "Windows_Computer_Name", None)),
+        "Win_OS": _clean_text(getattr(payload, "Win_OS", None)),
+        "Location_Floor": _clean_text(getattr(payload, "Location_Floor", None)),
+        "Notes": _clean_text(getattr(payload, "Notes", None)),
+        "If_Deleted": _normalize_flag(getattr(payload, "If_Deleted", 0)),
+    }
+
+
+def _prepare_payload_params(payload):
+    data = _prepare_payload_dict(payload)
+    return data, [
+        data["Country"],
+        data["Status"],
+        data["Name_Surname"],
+        data["Identity"],
+        data["Department"],
+        data["Region"],
+        data["Hardware_Type"],
+        data["Hardware_Manufacturer"],
+        data["Hardware_Model"],
+        data["Hardware_Serial_Number"],
+        data["Asset_Number"],
+        data["Capitalization_Date"],
+        data["User_Name"],
+        data["Old_User"],
+        data["Windows_Computer_Name"],
+        data["Win_OS"],
+        data["Location_Floor"],
+        data["Notes"],
+        data["If_Deleted"],
+    ]
+
+
+WRITE_COLUMN_SQL = {
+    "Country": "[Country]",
+    "Status": "[Status]",
+    "Name_Surname": "[Name_Surname]",
+    "Identity": "[Identity]",
+    "Department": "[Department]",
+    "Region": "[Region]",
+    "Hardware_Type": "[Hardware_Type]",
+    "Hardware_Manufacturer": "[Hardware_Manufacturer]",
+    "Hardware_Model": "[Hardware_Model]",
+    "Hardware_Serial_Number": "[Hardware_Serial_Number]",
+    "Asset_Number": "[Asset_Number]",
+    "Capitalization_Date": "[Capitalization_Date]",
+    "User_Name": "[User_Name]",
+    "Old_User": "[Old_User]",
+    "Windows_Computer_Name": "[Windows_Computer_Name]",
+    "Win_OS": "[Win_OS]",
+    "Location_Floor": "[Location/Floor]",
+    "Notes": "[Notes]",
+    "If_Deleted": "[If_Deleted]",
+}
+
+
+def _build_exact_match_sql(cleaned):
+    clauses = []
+    params: List[object] = []
+    for key, column_sql in WRITE_COLUMN_SQL.items():
+        value = cleaned.get(key)
+        if value is None:
+            clauses.append(f"{column_sql} IS NULL")
+        else:
+            clauses.append(f"{column_sql} = ?")
+            params.append(value)
+    where = " AND ".join(clauses) if clauses else "1=1"
+    return where, params
+
+
+UPDATE_ITEM_SQL = """
+UPDATE [dbo].[ITHardware]
+SET
+  Country = ?,
+  Status = ?,
+  Name_Surname = ?,
+  [Identity] = ?,
+  Department = ?,
+  Region = ?,
+  Hardware_Type = ?,
+  Hardware_Manufacturer = ?,
+  Hardware_Model = ?,
+  Hardware_Serial_Number = ?,
+  Asset_Number = ?,
+  Capitalization_Date = TRY_CONVERT(date, ?, 23),
+  User_Name = ?,
+  Old_User = ?,
+  Windows_Computer_Name = ?,
+  Win_OS = ?,
+  [Location/Floor] = ?,
+  Notes = ?,
+  If_Deleted = ?
+WHERE {where_clause};
+"""
+
+
 PARAM_FILTERS = {
     "country": ("[Country]", "like"),
     "status": ("[Status]", "like"),
@@ -495,6 +630,7 @@ class HardwareCreate(BaseModel):
     Capitalization_Date: Optional[Union[str, date]] = Field(None, description="YYYY-MM-DD")
     Old_User: Optional[str] = None
     Notes: Optional[str] = None
+    If_Deleted: Optional[int] = Field(0, ge=0, le=1)
 
     # INSERT edilemeyen/computed gibi davranan alan
     Age: Optional[float] = Field(None, ge=0)
@@ -512,7 +648,7 @@ class HardwareCreate(BaseModel):
             pass
         return v
 
-@app.post("/items")
+@app.post("/items", status_code=201)
 def create_item(payload: HardwareCreate):
     sql = """
     INSERT INTO [dbo].[ITHardware] (
@@ -533,29 +669,162 @@ def create_item(payload: HardwareCreate):
     );
     """
 
-    params = [
-        payload.Country, payload.Status, payload.Name_Surname, payload.Identity,
-        payload.Department, payload.Region,
-        payload.Hardware_Type, payload.Hardware_Manufacturer, payload.Hardware_Model,
-        payload.Hardware_Serial_Number, payload.Asset_Number,
-        payload.Capitalization_Date, payload.User_Name, payload.Old_User,
-        payload.Windows_Computer_Name, payload.Win_OS, payload.Location_Floor, payload.Notes,
-        0  # If_Deleted = false
-    ]
+    cleaned, params = _prepare_payload_params(payload)
 
     with get_conn() as conn:
         cur = conn.cursor()
         try:
+            # Duplicate serial check
+            serial = cleaned.get("Hardware_Serial_Number")
+            if serial:
+                cur.execute(
+                    "SELECT TOP 1 ID FROM [dbo].[ITHardware] WHERE [Hardware_Serial_Number] = ?",
+                    serial,
+                )
+                if cur.fetchone():
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "duplicate_serial",
+                            "message": "An item with this hardware serial number already exists.",
+                        },
+                    )
+
+            # Exact row duplicate check
+            where_sql, match_params = _build_exact_match_sql(cleaned)
+            cur.execute(
+                f"SELECT TOP 1 ID FROM [dbo].[ITHardware] WHERE {where_sql}",
+                match_params,
+            )
+            if cur.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "duplicate_row",
+                        "message": "An identical item is already registered in the inventory.",
+                    },
+                )
+
             cur.execute(sql, params)
             conn.commit()
-            try:
-                cur.execute("SELECT SCOPE_IDENTITY()")
-                new_id = cur.fetchone()[0]
-            except Exception:
-                new_id = None
-            return {"ok": True, "id": new_id}
+        except HTTPException as http_err:
+            conn.rollback()
+            raise http_err
         except Exception as e:
-            return {"ok": False, "error": str(e), "params": params}
+            conn.rollback()
+            raise HTTPException(status_code=500, detail={"message": str(e)}) from e
+        new_id = None
+        try:
+            cur.execute("SELECT SCOPE_IDENTITY()")
+            row = cur.fetchone()
+            if row:
+                new_id = row[0]
+        except Exception:
+            new_id = None
+    return {"ok": True, "id": new_id}
+
+
+@app.put("/items/{item_ref}")
+def update_item(item_ref: str, payload: HardwareCreate):
+    cleaned, params = _prepare_payload_params(payload)
+    reference = _clean_text(item_ref)
+    if not reference:
+        raise HTTPException(status_code=400, detail="Invalid item reference.")
+    with get_conn() as conn:
+        cur = conn.cursor()
+        updated = 0
+        candidate_id: Optional[int] = None
+        try:
+            candidate_id = int(reference)
+        except (TypeError, ValueError):
+            candidate_id = None
+        try:
+            if candidate_id is not None:
+                serial = cleaned.get("Hardware_Serial_Number")
+                if serial:
+                    cur.execute(
+                        "SELECT ID FROM [dbo].[ITHardware] WHERE [Hardware_Serial_Number] = ? AND [ID] <> ?",
+                        serial,
+                        candidate_id,
+                    )
+                    if cur.fetchone():
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "duplicate_serial",
+                                "message": "An item with this hardware serial number already exists.",
+                            },
+                        )
+                cur.execute(
+                    UPDATE_ITEM_SQL.format(where_clause="[ID] = ?"),
+                    [*params, candidate_id],
+                )
+                updated = cur.rowcount
+            if updated == 0:
+                serial = cleaned.get("Hardware_Serial_Number")
+                if serial:
+                    cur.execute(
+                        "SELECT ID FROM [dbo].[ITHardware] WHERE [Hardware_Serial_Number] = ? AND [Asset_Number] <> ?",
+                        serial,
+                        reference,
+                    )
+                    if cur.fetchone():
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "duplicate_serial",
+                                "message": "An item with this hardware serial number already exists.",
+                            },
+                        )
+                cur.execute(
+                    UPDATE_ITEM_SQL.format(where_clause="[Asset_Number] = ?"),
+                    [*params, reference],
+                )
+                updated = cur.rowcount
+            if updated == 0:
+                conn.rollback()
+                raise HTTPException(status_code=404, detail="Item not found.")
+            conn.commit()
+        except HTTPException as http_err:
+            conn.rollback()
+            raise http_err
+        except Exception as exc:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail={"message": str(exc)}) from exc
+    resolved = candidate_id if (candidate_id is not None and updated) else reference
+    return {"ok": True, "updated": updated, "id": resolved}
+
+
+@app.delete("/items/{item_ref}")
+def delete_item(item_ref: str):
+    reference = _clean_text(item_ref)
+    if not reference:
+        raise HTTPException(status_code=400, detail="Invalid item reference.")
+    with get_conn() as conn:
+        cur = conn.cursor()
+        deleted = 0
+        candidate_id: Optional[int] = None
+        try:
+            candidate_id = int(reference)
+        except (TypeError, ValueError):
+            candidate_id = None
+        try:
+            if candidate_id is not None:
+                cur.execute("DELETE FROM [dbo].[ITHardware] WHERE [ID] = ?", candidate_id)
+                deleted = cur.rowcount
+            if deleted == 0:
+                cur.execute("DELETE FROM [dbo].[ITHardware] WHERE [Asset_Number] = ?", reference)
+                deleted = cur.rowcount
+            if deleted == 0:
+                conn.rollback()
+                raise HTTPException(status_code=404, detail="Item not found.")
+            conn.commit()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail={"message": str(exc)}) from exc
+    return {"ok": True, "deleted": deleted}
 
 # -------------------------------------------
 # Ülke bazında spare oranları
