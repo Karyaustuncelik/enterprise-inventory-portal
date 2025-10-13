@@ -66,6 +66,9 @@ def _prepare_payload_dict(payload):
 
 def _prepare_payload_params(payload):
     data = _prepare_payload_dict(payload)
+    for field in REQUIRED_DB_STR_FIELDS:
+        if data.get(field) is None:
+            data[field] = ""
     return data, [
         data["Country"],
         data["Status"],
@@ -109,6 +112,17 @@ WRITE_COLUMN_SQL = {
     "Location_Floor": "[Location/Floor]",
     "Notes": "[Notes]",
     "If_Deleted": "[If_Deleted]",
+}
+
+
+REQUIRED_DB_STR_FIELDS = {
+    "Identity",
+    "Region",
+    "Hardware_Type",
+    "Hardware_Manufacturer",
+    "Windows_Computer_Name",
+    "Win_OS",
+    "User_Name",
 }
 
 
@@ -611,17 +625,18 @@ def delete_field_parameter(
 # Yeni kayıt oluşturma (POST)
 # -----------------------------
 class HardwareCreate(BaseModel):
+    Name_Surname: str = Field(..., min_length=1, max_length=50)
+    Hardware_Serial_Number: str = Field(..., min_length=1, max_length=50)
+    Asset_Number: str = Field(..., min_length=1, max_length=50)
+
     Country: str = Field(..., min_length=2, max_length=2)
-    Name_Surname: str = Field(..., max_length=50)
-    Identity: str = Field(..., max_length=10)
-    Region: str = Field(..., max_length=8)
-    Win_OS: str = Field(..., max_length=15)
-    Hardware_Type: str = Field(..., max_length=20)
-    Hardware_Manufacturer: str = Field(..., max_length=60)
-    Windows_Computer_Name: str = Field(..., max_length=100)
-    User_Name: str = Field(..., max_length=30)
-    Hardware_Serial_Number: str = Field(..., max_length=50)
-    Asset_Number: str = Field(..., max_length=50)
+    Identity: Optional[str] = Field(None, max_length=10)
+    Region: Optional[str] = Field(None, max_length=8)
+    Win_OS: Optional[str] = Field(None, max_length=15)
+    Hardware_Type: Optional[str] = Field(None, max_length=20)
+    Hardware_Manufacturer: Optional[str] = Field(None, max_length=60)
+    Windows_Computer_Name: Optional[str] = Field(None, max_length=100)
+    User_Name: Optional[str] = Field(None, max_length=30)
 
     Status: Optional[str] = Field(None, max_length=30)
     Department: Optional[str] = Field(None, max_length=50)
