@@ -1,0 +1,23 @@
+﻿{
+  "users": [
+    {"username": "ENTERPRISE\\admin", "displayName": "Portfolio Admin", "role": "Admin"},
+    {"username": "ENTERPRISE\\editor", "displayName": "Portfolio Editor", "role": "Edit"},
+    {"username": "ENTERPRISE\\viewer", "displayName": "Portfolio Viewer", "role": "View"}
+  ],
+  "items": [
+    {
+      "Country": "TR",
+      "Status": "Assigned",
+      "Name_Surname": "Alex Johnson",
+      "Hardware_Serial_Number": "SN-TR-0001",
+      "Asset_Number": "ASSET-0001"
+    },
+    {
+      "Country": "AE",
+      "Status": "In Inventory",
+      "Name_Surname": "Lina Khan",
+      "Hardware_Serial_Number": "SN-AE-0002",
+      "Asset_Number": "ASSET-0002"
+    }
+  ]
+}

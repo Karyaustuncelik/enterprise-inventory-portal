@@ -1,0 +1,34 @@
+.loading-logo {
+  width: 100%;
+  min-height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.loading-logo-image {
+  display: block;
+  max-width: min(70vw, 220px);
+  filter: drop-shadow(0 10px 24px rgba(225, 0, 15, 0.12));
+  animation: brand-logo-pulse 1.1s ease-in-out infinite;
+  transform-origin: center;
+}
+
+@keyframes brand-logo-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.35;
+    transform: scale(0.985);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-logo-image {
+    animation: none;
+  }
+}
