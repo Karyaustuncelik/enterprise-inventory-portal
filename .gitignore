@@ -1,0 +1,17 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.venv_py313_broken/
+
+# Local logs and packaging artifacts
+*.log
+*.zip
+%TEMP%/
+_codex_backup_*/
+_patched_test_main.py
+
+# Editor settings
+.vscode/

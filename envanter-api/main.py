@@ -2,16 +2,13 @@
 
 import logging
 import os
-import re
-import uuid
-import json
 import ipaddress
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -32,7 +29,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-) 
+)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("enterprise_inventory_portal.api")
@@ -170,11 +167,6 @@ class UserRecord:
     def is_admin(self) -> bool:
         role_name = (self.role_name or "").strip().lower()
         return (self.role_id in get_auth_settings().admin_role_ids) or role_name == "admin"
-
-    @property
-    def is_viewer(self) -> bool:
-        role_name = (self.role_name or "").strip().lower()
-        return self.role_id == 3 or role_name == "view"
 
 
 def _normalise_username(username: str) -> str:
@@ -625,15 +617,6 @@ async def require_admin(user: UserRecord = Depends(get_current_user)) -> UserRec
     return user
 
 
-async def require_editor(user: UserRecord = Depends(get_current_user)) -> UserRecord:
-    if user.is_viewer:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"message": "User does not have permission to perform this action."},
-        )
-    return user
-
-
 @users_router.get("/users/me", response_model=UserResponse)
 async def get_me(user: UserRecord = Depends(get_current_user)) -> UserResponse:
     return UserResponse.from_record(user)
@@ -725,26 +708,12 @@ async def create_or_update_user(
     return UserResponse.from_record(record)
 
 
-@users_router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_user(
-    user_id: int,
-    _: UserRecord = Depends(require_admin),
-) -> Response:
-    deleted = _delete_user(user_id)
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"message": f"User with id {user_id} not found."},
-        )
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
 @users_router.get("/directory/search", response_model=List[DirectoryUserResponse])
 async def directory_search(
     q: Optional[str] = Query(None, min_length=2, max_length=128),
     prefix: Optional[str] = Query(None, alias="Prefix", min_length=2, max_length=128),
     legacy_prefix: Optional[str] = Query(None, alias="prefix", min_length=2, max_length=128),
-    _: UserRecord = Depends(require_editor),
+    _: UserRecord = Depends(require_admin),
 ) -> List[DirectoryUserResponse]:
     settings = get_auth_settings()
     if not settings.directory_enabled:
@@ -759,7 +728,7 @@ async def directory_search(
 @users_router.get("/AutoSuggestName")
 async def auto_suggest_name(
     Prefix: Optional[str] = Query(None, min_length=2, max_length=128),
-    _: UserRecord = Depends(require_editor),
+    _: UserRecord = Depends(require_admin),
 ) -> List[Dict[str, str]]:
     settings = get_auth_settings()
     if not settings.directory_enabled:
@@ -779,721 +748,6 @@ async def auto_suggest_name(
 
 
 app.include_router(users_router)
-
-class ChatRequest(CamelModel):
-    question: str = Field(..., min_length=2, max_length=500)
-
-
-class ChatResponse(CamelModel):
-    answer: str
-    data: Optional[Dict[str, Any]] = None
-
-
-_CHAT_LAPTOP_TYPES = ("LAPTOP", "NOTEBOOK")
-_GREETINGS = ("merhaba", "selam", "hello", "hi", "naber", "nasilsin", "nasil", "nasilsiniz")
-
-
-def _extract_asset_number(text: str) -> Optional[str]:
-    match = re.search(r"\b([A-Za-z0-9_-]{4,})\b", text)
-    return match.group(1) if match else None
-
-
-def _extract_name_for_user_search(text: str) -> Optional[str]:
-    lowered = text.lower()
-    stop_words = {
-        "bir",
-        "kullanici",
-        "user",
-        "var",
-        "mi",
-        "mu",
-        "varmi",
-        "varmu",
-        "var mi",
-        "var mu",
-        "isimli",
-        "adli",
-    }
-    tokens = re.findall(r"\w+", lowered, flags=re.UNICODE)
-    filtered = [tok for tok in tokens if tok not in stop_words]
-    if not filtered:
-        return None
-    candidate = filtered[0]
-    return candidate.strip()
-
-
-def _parse_country_from_text(text: str) -> Optional[str]:
-    lowered = text.lower()
-    for key in ("turkiye", "turkey", "tr"):
-        if key in lowered:
-            return "TR"
-    return None
-
-
-def _parse_chat_intent(text: str) -> Optional[Dict[str, Any]]:
-    lowered = text.lower()
-    normalised = (
-        lowered.replace("ı", "i")
-        .replace("ş", "s")
-        .replace("ğ", "g")
-        .replace("ç", "c")
-        .replace("ö", "o")
-        .replace("ü", "u")
-    )
-
-    if any(greet in lowered or greet in normalised for greet in _GREETINGS):
-        return {"type": "greeting"}
-
-    if "laptop" in normalised and ("toplam" in normalised or "kac" in normalised):
-        country = _parse_country_from_text(lowered)
-        if country:
-            return {"type": "count_laptops_country", "country": country}
-        return {"type": "count_laptops"}
-
-    if "asset" in normalised and ("kimde" in normalised or "kimin" in normalised or "kim" in normalised):
-        asset = _extract_asset_number(text)
-        return {"type": "asset_holder", "asset": asset}
-
-    if "laptop" in normalised:
-        name = _extract_name_for_user_search(text)
-        if name:
-            return {"type": "user_laptop_count", "name": name}
-
-    if "kullanici" in normalised or "user" in normalised:
-        name = _extract_name_for_user_search(text)
-        if name:
-            return {"type": "user_exists", "name": name}
-
-    if "departman" in normalised or "department" in normalised:
-        name = _extract_name_for_user_search(text)
-        if name:
-            return {"type": "user_department", "name": name}
-
-    # Generic fallback: if a name-like token is present, try to summarise that user
-    name = _extract_name_for_user_search(text)
-    if name:
-        return {"type": "user_summary", "name": name}
-
-    return None
-
-chat_router = APIRouter(tags=["Chat"])
-
-
-@chat_router.post("/chat", response_model=ChatResponse)
-def chat_endpoint(payload: ChatRequest) -> ChatResponse:
-    intent = _parse_chat_intent(payload.question)
-    if not intent:
-        return ChatResponse(
-            answer="I do not support that question right now."
-        )
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        if intent["type"] == "greeting":
-            return ChatResponse(answer="Hello! You can ask a question about the inventory.")
-
-        if intent["type"] == "count_laptops":
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM [dbo].[ITHardware]
-                WHERE UPPER(LTRIM(RTRIM([Hardware_Type]))) IN (?, ?)
-                  AND ISNULL([If_Deleted], 0) = 0
-                """,
-                *_CHAT_LAPTOP_TYPES,
-            )
-            count = int(cur.fetchone()[0])
-            return ChatResponse(answer=f"There are {count} laptops in total.", data={"count": count})
-
-        if intent["type"] == "count_laptops_country":
-            country = _normalise_country_code(intent.get("country"))
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM [dbo].[ITHardware]
-                WHERE UPPER(LTRIM(RTRIM([Hardware_Type]))) IN (?, ?)
-                  AND UPPER(LTRIM(RTRIM([Country]))) = ?
-                  AND ISNULL([If_Deleted], 0) = 0
-                """,
-                *_CHAT_LAPTOP_TYPES,
-                country,
-            )
-            count = int(cur.fetchone()[0])
-            return ChatResponse(
-                answer=f"There are {count} laptops for {country}.",
-                data={"country": country, "count": count},
-            )
-
-        if intent["type"] == "asset_holder":
-            asset = intent.get("asset")
-            if not asset:
-                raise HTTPException(status_code=400, detail={"message": "Asset number could not be determined."})
-            cur.execute(
-                """
-                SELECT TOP 1 Asset_Number, Name_Surname, User_Name, Hardware_Type, Status, Country
-                FROM [dbo].[ITHardware]
-                WHERE Asset_Number = ?
-                """,
-                asset,
-            )
-            row = cur.fetchone()
-            if not row:
-                return ChatResponse(answer=f"Asset number {asset} was not found.", data={"asset": asset})
-            asset_number, name_surname, user_name, hw_type, status_value, country = row
-            holder = name_surname or user_name or "unknown"
-            answer = (
-                f"Asset {asset_number} ({hw_type}) is currently assigned to {holder} "
-                f"(status: {status_value})."
-            )
-            return ChatResponse(
-                answer=answer,
-                data={
-                    "asset": asset_number,
-                    "holder": holder,
-                    "status": status_value,
-                    "country": country,
-                    "type": hw_type,
-                },
-            )
-
-        if intent["type"] == "user_laptop_count":
-            name = intent.get("name")
-            if not name:
-                return ChatResponse(answer="Which user should I check laptops for?")
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM [dbo].[ITHardware]
-                WHERE UPPER(LTRIM(RTRIM(Name_Surname))) LIKE ?
-                  AND UPPER(LTRIM(RTRIM([Hardware_Type]))) IN (?, ?)
-                  AND ISNULL([If_Deleted], 0) = 0
-                """,
-                f"%{name.upper()}%",
-                *_CHAT_LAPTOP_TYPES,
-            )
-            laptop_count = int(cur.fetchone()[0])
-            if laptop_count == 0:
-                return ChatResponse(
-                    answer=f"No laptop records found for {name}.",
-                    data={"name": name, "laptops": 0},
-                )
-            return ChatResponse(
-                answer=f"There are {laptop_count} laptop records for {name}.",
-                data={"name": name, "laptops": laptop_count},
-            )
-
-        if intent["type"] == "user_exists":
-            name = intent.get("name")
-            display_column = _get_user_roles_display_column()
-            display_sql = f"[{display_column}]" if display_column else "NULL"
-            cur.execute(
-                f"""
-                SELECT TOP 1 Username, {display_sql} AS DisplayName
-                FROM [dbo].[UserRoles]
-                WHERE UPPER(LTRIM(RTRIM(Username))) LIKE ?
-                   OR UPPER(LTRIM(RTRIM({display_sql}))) LIKE ?
-                """,
-                f"%{name.upper()}%",
-                f"%{name.upper()}%",
-            )
-            row = cur.fetchone()
-            if row:
-                username, display_name = row
-                resolved = display_name or username
-                return ChatResponse(
-                    answer=f"{resolved} exists in the records.",
-                    data={"username": username, "display_name": display_name or username},
-                )
-
-            # Fallback: look into hardware table by Name_Surname
-            cur.execute(
-                """
-                SELECT TOP 1 Name_Surname, User_Name
-                FROM [dbo].[ITHardware]
-                WHERE UPPER(LTRIM(RTRIM(Name_Surname))) LIKE ?
-            """,
-                f"%{name.upper()}%",
-            )
-            hw_row = cur.fetchone()
-            if hw_row:
-                name_surname, user_name = hw_row
-                holder = name_surname or user_name or name
-                cur.execute(
-                    """
-                    SELECT COUNT(*) FROM [dbo].[ITHardware]
-                    WHERE UPPER(LTRIM(RTRIM(Name_Surname))) LIKE ?
-                      AND UPPER(LTRIM(RTRIM([Hardware_Type]))) IN (?, ?)
-                      AND ISNULL([If_Deleted], 0) = 0
-                    """,
-                    f"%{name.upper()}%",
-                    *_CHAT_LAPTOP_TYPES,
-                )
-                laptop_count = int(cur.fetchone()[0])
-                return ChatResponse(
-                    answer=f"{holder} exists in the records. Laptop count: {laptop_count}.",
-                    data={"name": holder, "laptops": laptop_count},
-                )
-
-            return ChatResponse(answer=f"No user named {name} was found.", data={"name": name})
-
-        if intent["type"] == "user_department":
-            name = intent.get("name")
-            if not name:
-                return ChatResponse(answer="Which user's department should I look up?")
-            cur.execute(
-                """
-                SELECT TOP 1 Name_Surname, Department
-                FROM [dbo].[ITHardware]
-                WHERE UPPER(LTRIM(RTRIM(Name_Surname))) LIKE ?
-                  AND ISNULL([If_Deleted], 0) = 0
-                ORDER BY Department DESC
-                """,
-                f"%{name.upper()}%",
-            )
-            row = cur.fetchone()
-            if not row:
-                return ChatResponse(
-                    answer=f"No department information found for {name}.",
-                    data={"name": name},
-                )
-            name_surname, department = row
-            dept_value = department or "unknown"
-            return ChatResponse(
-                answer=f"{name_surname} department: {dept_value}.",
-                data={"name": name_surname, "department": dept_value},
-            )
-
-        if intent["type"] == "user_summary":
-            name = intent.get("name")
-            if not name:
-                return ChatResponse(answer="Which user should I look up?")
-            cur.execute(
-                """
-                SELECT TOP 1 Name_Surname, Department, Country
-                FROM [dbo].[ITHardware]
-                WHERE UPPER(LTRIM(RTRIM(Name_Surname))) LIKE ?
-                  AND ISNULL([If_Deleted], 0) = 0
-                """,
-                f"%{name.upper()}%",
-            )
-            row = cur.fetchone()
-            if not row:
-                return ChatResponse(answer=f"No records found for {name}.", data={"name": name})
-            name_surname, department, country = row
-            cur.execute(
-                """
-                SELECT
-                  SUM(CASE WHEN UPPER(LTRIM(RTRIM([Hardware_Type]))) IN (?, ?) THEN 1 ELSE 0 END) AS laptop_count,
-                  COUNT(*) AS total_count
-                FROM [dbo].[ITHardware]
-                WHERE UPPER(LTRIM(RTRIM(Name_Surname))) LIKE ?
-                  AND ISNULL([If_Deleted], 0) = 0
-                """,
-                *_CHAT_LAPTOP_TYPES,
-                f"%{name.upper()}%",
-            )
-            laptop_count, total_count = cur.fetchone()
-            dept_value = department or "unknown"
-            country_value = country or "unknown"
-            answer = (
-                f"{name_surname} exists in the records. Department: {dept_value}. Country: {country_value}. "
-                f"Laptop count: {int(laptop_count or 0)}. Total inventory: {int(total_count or 0)}."
-            )
-            return ChatResponse(
-                answer=answer,
-                data={
-                    "name": name_surname,
-                    "department": dept_value,
-                    "country": country_value,
-                    "laptops": int(laptop_count or 0),
-                    "total": int(total_count or 0),
-                },
-            )
-
-    return ChatResponse(answer="I cannot answer that question right now.")
-
-
-app.include_router(chat_router)
-
-
-# -----------------------------
-# Charts (shared)
-# -----------------------------
-_VALID_CHART_METRICS = {"count", "ratio"}
-
-
-def _generate_chart_id() -> str:
-    return str(uuid.uuid4())
-
-
-def _normalise_chart_id(raw_id: Optional[str], *, allow_none: bool = True) -> Optional[str]:
-    if raw_id is None:
-        if allow_none:
-            return None
-        raise HTTPException(status_code=400, detail={"message": "id is required."})
-
-    if not isinstance(raw_id, str) or not raw_id.strip():
-        raise HTTPException(status_code=400, detail={"message": "id must be a non-empty string."})
-
-    value = raw_id.strip()
-    try:
-        if value.lower().startswith("chart-"):
-            return str(uuid.UUID(hex=value[6:]))
-        return str(uuid.UUID(value))
-    except (ValueError, AttributeError):
-        raise HTTPException(status_code=400, detail={"message": "id is invalid. Expected GUID."})
-
-
-def _resolve_chart_payload(
-    payload_body: Optional[Dict[str, Any]],
-    payload_query: Optional[str],
-) -> Dict[str, Any]:
-    if payload_body is not None:
-        return payload_body
-
-    if payload_query is None:
-        raise HTTPException(status_code=400, detail={"message": "Invalid JSON payload."})
-
-    try:
-        payload = json.loads(payload_query)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail={"message": "Query payload must be valid JSON."}) from exc
-
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail={"message": "Query payload must be a JSON object."})
-    return payload
-
-
-def _require_chart_field(payload: Dict[str, Any], key: str) -> Any:
-    if key not in payload:
-        raise HTTPException(
-            status_code=400,
-            detail={"message": f"Missing required field: {key}."},
-        )
-    return payload.get(key)
-
-
-def _validate_chart_payload(payload: Any) -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail={"message": "Invalid JSON payload."})
-
-    title = _require_chart_field(payload, "title")
-    if title is not None and not isinstance(title, str):
-        raise HTTPException(status_code=400, detail={"message": "title must be a string or null."})
-
-    group_by = _require_chart_field(payload, "groupBy")
-    if not isinstance(group_by, str):
-        raise HTTPException(status_code=400, detail={"message": "groupBy must be a string."})
-
-    metric = _require_chart_field(payload, "metric")
-    if not isinstance(metric, str):
-        raise HTTPException(status_code=400, detail={"message": "metric must be a string."})
-    metric_value = metric.strip().lower()
-    if metric_value not in _VALID_CHART_METRICS:
-        raise HTTPException(status_code=400, detail={"message": "metric must be 'count' or 'ratio'."})
-
-    filter_by = _require_chart_field(payload, "filterBy")
-    if not isinstance(filter_by, str):
-        raise HTTPException(status_code=400, detail={"message": "filterBy must be a string."})
-
-    filter_value = _require_chart_field(payload, "filterValue")
-    if not isinstance(filter_value, str):
-        raise HTTPException(status_code=400, detail={"message": "filterValue must be a string."})
-
-    group_filter_value = payload.get("groupFilterValue", "")
-    if group_filter_value is None:
-        group_filter_value = ""
-    if not isinstance(group_filter_value, str):
-        raise HTTPException(status_code=400, detail={"message": "groupFilterValue must be a string."})
-
-    chart_id = payload.get("id")
-    if chart_id is not None:
-        if not isinstance(chart_id, str) or not chart_id.strip():
-            raise HTTPException(status_code=400, detail={"message": "id must be a non-empty string."})
-        chart_id = chart_id.strip()
-
-    return {
-        "id": chart_id,
-        "title": title,
-        "groupBy": group_by,
-        "groupFilterValue": group_filter_value,
-        "metric": metric_value,
-        "filterBy": filter_by,
-        "filterValue": filter_value,
-    }
-
-
-def _chart_response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    raw_id = row.get("id")
-    return {
-        "id": str(raw_id) if raw_id is not None else None,
-        "title": row.get("title") if row.get("title") is not None else "",
-        "groupBy": row.get("groupBy") or "",
-        "groupFilterValue": row.get("groupFilterValue") or "",
-        "metric": (row.get("metric") or "").lower(),
-        "filterBy": row.get("filterBy") or "",
-        "filterValue": row.get("filterValue") or "",
-    }
-
-
-def _ensure_charts_table(conn) -> None:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        IF NOT EXISTS (
-            SELECT 1
-            FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA = 'dbo'
-              AND TABLE_NAME = 'charts'
-        )
-        BEGIN
-            CREATE TABLE [dbo].[charts] (
-                [id] NVARCHAR(64) NOT NULL PRIMARY KEY,
-                [title] NVARCHAR(200) NULL,
-                [groupBy] NVARCHAR(100) NOT NULL,
-                [groupFilterValue] NVARCHAR(400) NOT NULL
-                    CONSTRAINT [DF_charts_groupFilterValue] DEFAULT (''),
-                [metric] NVARCHAR(10) NOT NULL,
-                [filterBy] NVARCHAR(100) NOT NULL,
-                [filterValue] NVARCHAR(200) NOT NULL,
-                [created_at] DATETIME2(0) NOT NULL
-                    CONSTRAINT [DF_charts_created_at] DEFAULT SYSUTCDATETIME(),
-                [updated_at] DATETIME2(0) NOT NULL
-                    CONSTRAINT [DF_charts_updated_at] DEFAULT SYSUTCDATETIME(),
-                CONSTRAINT [CK_charts_metric] CHECK ([metric] IN ('count', 'ratio'))
-            );
-        END;
-
-        IF COL_LENGTH('dbo.charts', 'groupFilterValue') IS NULL
-        BEGIN
-            ALTER TABLE [dbo].[charts]
-            ADD [groupFilterValue] NVARCHAR(400) NOT NULL
-                CONSTRAINT [DF_charts_groupFilterValue] DEFAULT ('');
-        END;
-        """
-    )
-    conn.commit()
-
-
-def _fetch_charts() -> List[Dict[str, Any]]:
-    sql = """
-        SELECT [id], [title], [groupBy], [groupFilterValue], [metric], [filterBy], [filterValue]
-        FROM [dbo].[charts]
-        ORDER BY [created_at] ASC, [id] ASC;
-    """
-    with get_conn() as conn:
-        _ensure_charts_table(conn)
-        cur = conn.cursor()
-        cur.execute(sql)
-        cols = [col[0] for col in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-def _fetch_chart_by_id(chart_id: str) -> Optional[Dict[str, Any]]:
-    sql = """
-        SELECT [id], [title], [groupBy], [groupFilterValue], [metric], [filterBy], [filterValue]
-        FROM [dbo].[charts]
-        WHERE [id] = ?;
-    """
-    with get_conn() as conn:
-        _ensure_charts_table(conn)
-        cur = conn.cursor()
-        cur.execute(sql, chart_id)
-        row = cur.fetchone()
-        if not row:
-            return None
-        cols = [col[0] for col in cur.description]
-        return dict(zip(cols, row))
-
-
-def _insert_chart(chart: Dict[str, Any]) -> Dict[str, Any]:
-    sql = """
-        INSERT INTO [dbo].[charts] (
-            [id], [title], [groupBy], [groupFilterValue], [metric], [filterBy], [filterValue]
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?);
-    """
-    stored: Optional[Dict[str, Any]] = None
-    with get_conn() as conn:
-        _ensure_charts_table(conn)
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT 1 FROM [dbo].[charts] WHERE [id] = ?", chart["id"])
-            if cur.fetchone():
-                raise HTTPException(status_code=409, detail={"message": "Chart id already exists."})
-            cur.execute(
-                sql,
-                chart["id"],
-                chart["title"],
-                chart["groupBy"],
-                chart["groupFilterValue"],
-                chart["metric"],
-                chart["filterBy"],
-                chart["filterValue"],
-            )
-            cur.execute(
-                """
-                SELECT [id], [title], [groupBy], [groupFilterValue], [metric], [filterBy], [filterValue]
-                FROM [dbo].[charts]
-                WHERE [id] = ?;
-                """,
-                chart["id"],
-            )
-            row = cur.fetchone()
-            if row:
-                cols = [col[0] for col in cur.description]
-                stored = dict(zip(cols, row))
-            conn.commit()
-        except HTTPException:
-            conn.rollback()
-            raise
-        except Exception:
-            conn.rollback()
-            raise
-    return stored or chart
-
-
-def _update_chart(chart_id: str, chart: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    sql = """
-        UPDATE [dbo].[charts]
-        SET [title] = ?,
-            [groupBy] = ?,
-            [groupFilterValue] = ?,
-            [metric] = ?,
-            [filterBy] = ?,
-            [filterValue] = ?,
-            [updated_at] = SYSUTCDATETIME()
-        WHERE [id] = ?;
-    """
-    stored: Optional[Dict[str, Any]] = None
-    with get_conn() as conn:
-        _ensure_charts_table(conn)
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                sql,
-                chart["title"],
-                chart["groupBy"],
-                chart["groupFilterValue"],
-                chart["metric"],
-                chart["filterBy"],
-                chart["filterValue"],
-                chart_id,
-            )
-            if cur.rowcount == 0:
-                conn.rollback()
-                return None
-            cur.execute(
-                """
-                SELECT [id], [title], [groupBy], [groupFilterValue], [metric], [filterBy], [filterValue]
-                FROM [dbo].[charts]
-                WHERE [id] = ?;
-                """,
-                chart_id,
-            )
-            row = cur.fetchone()
-            if row:
-                cols = [col[0] for col in cur.description]
-                stored = dict(zip(cols, row))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    return stored
-
-
-def _delete_chart(chart_id: str) -> bool:
-    sql = "DELETE FROM [dbo].[charts] WHERE [id] = ?;"
-    with get_conn() as conn:
-        _ensure_charts_table(conn)
-        cur = conn.cursor()
-        try:
-            cur.execute(sql, chart_id)
-            deleted = cur.rowcount
-            if deleted == 0:
-                conn.rollback()
-                return False
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    return True
-
-
-charts_router = APIRouter(tags=["Charts"])
-
-
-@charts_router.get("/charts")
-def list_charts():
-    try:
-        rows = _fetch_charts()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail={"message": "Failed to load charts."}) from exc
-    return {"items": [_chart_response_from_row(row) for row in rows]}
-
-
-@charts_router.post("/charts", status_code=201)
-def create_chart(
-    payload: Optional[Dict[str, Any]] = Body(None),
-    payload_query: Optional[str] = Query(None, alias="payload"),
-    _: UserRecord = Depends(require_editor),
-):
-    chart_payload = _resolve_chart_payload(payload, payload_query)
-    chart = _validate_chart_payload(chart_payload)
-    if not chart["id"]:
-        chart["id"] = _generate_chart_id()
-    else:
-        try:
-            chart["id"] = _normalise_chart_id(chart["id"], allow_none=False)
-        except HTTPException:
-            # Legacy frontend may send non-GUID ids like "chart-..."; generate a backend GUID instead.
-            chart["id"] = _generate_chart_id()
-    try:
-        created = _insert_chart(chart)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail={"message": "Failed to create chart."}) from exc
-    return _chart_response_from_row(created)
-
-
-@charts_router.put("/charts/{chart_id}")
-def update_chart(
-    chart_id: str,
-    payload: Optional[Dict[str, Any]] = Body(None),
-    payload_query: Optional[str] = Query(None, alias="payload"),
-    _: UserRecord = Depends(require_editor),
-):
-    normalised_chart_id = _normalise_chart_id(chart_id, allow_none=False)
-    chart_payload = _resolve_chart_payload(payload, payload_query)
-    chart = _validate_chart_payload(chart_payload)
-    if chart["id"]:
-        chart["id"] = _normalise_chart_id(chart["id"], allow_none=False)
-    if chart["id"] and chart["id"] != normalised_chart_id:
-        raise HTTPException(status_code=400, detail={"message": "Payload id does not match URL id."})
-    chart["id"] = normalised_chart_id
-    try:
-        updated = _update_chart(normalised_chart_id, chart)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail={"message": "Failed to update chart."}) from exc
-    if not updated:
-        raise HTTPException(status_code=404, detail={"message": "Chart not found."})
-    return _chart_response_from_row(updated)
-
-
-@charts_router.delete("/charts/{chart_id}", status_code=204)
-def delete_chart(
-    chart_id: str,
-    _: UserRecord = Depends(require_editor),
-):
-    normalised_chart_id = _normalise_chart_id(chart_id, allow_none=False)
-    try:
-        deleted = _delete_chart(normalised_chart_id)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail={"message": "Failed to delete chart."}) from exc
-    if not deleted:
-        raise HTTPException(status_code=404, detail={"message": "Chart not found."})
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-app.include_router(charts_router)
 
 
 def _build_http_exception_payload(exc: HTTPException) -> Dict[str, Any]:
@@ -1864,32 +1118,6 @@ def _update_user_role(user_id: int, role_id: int) -> Optional[UserRecord]:
     return _fetch_user_by_id(user_id)
 
 
-def _delete_user(user_id: int) -> bool:
-    try:
-        conn = get_conn()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            DELETE FROM [dbo].[UserRoles]
-            WHERE Id = ?
-            """,
-            user_id,
-        )
-        if cursor.rowcount == 0:
-            conn.rollback()
-            return False
-        conn.commit()
-        return True
-    except Exception as exc:
-        logger.error("Failed to delete user %s: %s", user_id, exc)
-        raise
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
 def _insert_user(username: str, role_id: int, display_name: Optional[str]) -> UserRecord:
     display_column = _get_user_roles_display_column()
     columns = ["Username", "Role"]
@@ -1998,53 +1226,6 @@ def _normalize_flag(value) -> int:
     return 0
 
 
-def _is_disposed_status(value: Optional[str]) -> bool:
-    return "disposed" in (value or "").strip().lower()
-
-
-def _default_status_is_active(value: Optional[str]) -> bool:
-    return not _is_disposed_status(value)
-
-
-def _coerce_status_is_active(raw_active: Optional[object], value: Optional[str]) -> bool:
-    if raw_active is None:
-        return _default_status_is_active(value)
-    return bool(raw_active)
-
-
-def _fetch_status_is_active(conn, value: Optional[str]) -> Optional[bool]:
-    if not value:
-        return None
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            SELECT TOP 1 IsActive
-            FROM FieldParams
-            WHERE FieldName = ?
-              AND UPPER(LTRIM(RTRIM(ParamName))) = UPPER(?)
-            """,
-            "Status",
-            value,
-        )
-        row = cur.fetchone()
-    except Exception as exc:
-        logger.warning("Failed to fetch status is_active for %s: %s", value, exc)
-        return None
-    if not row:
-        return None
-    return None if row[0] is None else bool(row[0])
-
-
-def _resolve_if_deleted(conn, status_value: Optional[str], explicit_flag: Optional[int]) -> int:
-    if status_value:
-        is_active = _fetch_status_is_active(conn, status_value)
-        if is_active is None:
-            is_active = _default_status_is_active(status_value)
-        return 0 if is_active else 1
-    return 1 if explicit_flag else 0
-
-
 def _prepare_payload_dict(payload):
     return {
         "Country": _clean_text(getattr(payload, "Country", None), upper=True),
@@ -2069,10 +1250,8 @@ def _prepare_payload_dict(payload):
     }
 
 
-def _prepare_payload_params(payload, conn=None):
+def _prepare_payload_params(payload):
     data = _prepare_payload_dict(payload)
-    if conn is not None:
-        data["If_Deleted"] = _resolve_if_deleted(conn, data.get("Status"), data.get("If_Deleted"))
     for field in REQUIRED_DB_STR_FIELDS:
         if data.get(field) is None:
             data[field] = ""
@@ -2287,7 +1466,6 @@ class FieldParamItem(BaseModel):
     value: str
     usage_count: int
     managed: bool = True
-    is_active: Optional[bool] = None
 
 
 class FieldParametersResponse(BaseModel):
@@ -2296,7 +1474,6 @@ class FieldParametersResponse(BaseModel):
 
 class FieldParamCreate(BaseModel):
     value: str = Field(..., min_length=1, max_length=255)
-    is_active: Optional[bool] = None
 
     @field_validator("value")
     def normalise_value(cls, v: str) -> str:
@@ -2310,27 +1487,10 @@ class FieldParamUpdate(BaseModel):
     original: str = Field(..., min_length=1, max_length=255)
     value: str = Field(..., min_length=1, max_length=255)
     update_existing: bool = True
-    is_active: Optional[bool] = None
 
     @field_validator("original", "value")
     def normalise_update_values(cls, v: str) -> str:
         value = (v or "").strip()
-        if not value:
-            raise ValueError("Value cannot be empty.")
-        return value
-
-
-class FieldParamPathUpdate(BaseModel):
-    original: Optional[str] = Field(None, min_length=1, max_length=255)
-    value: Optional[str] = Field(None, min_length=1, max_length=255)
-    update_existing: bool = True
-    is_active: Optional[bool] = None
-
-    @field_validator("original", "value")
-    def normalise_optional_update_values(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return None
-        value = v.strip()
         if not value:
             raise ValueError("Value cannot be empty.")
         return value
@@ -2373,24 +1533,12 @@ def _fetch_field_params(conn, field: str) -> List[Dict[str, object]]:
     canonical = _ensure_choice_field(field)
     column_sql = _field_column_sql(canonical)
     managed_values: List[str] = []
-    status_active_map: Dict[str, bool] = {}
     cur = conn.cursor()
-    if canonical == "Status":
-        cur.execute(
-            "SELECT ParamName, IsActive FROM FieldParams WHERE FieldName = ? ORDER BY ParamName ASC",
-            canonical,
-        )
-        for raw_value, raw_active in cur.fetchall():
-            value = (raw_value or "").strip()
-            if value and value not in managed_values:
-                managed_values.append(value)
-                status_active_map[value] = _coerce_status_is_active(raw_active, value)
-    else:
-        cur.execute("SELECT ParamName FROM FieldParams WHERE FieldName = ? ORDER BY ParamName ASC", canonical)
-        for (raw_value,) in cur.fetchall():
-            value = (raw_value or "").strip()
-            if value and value not in managed_values:
-                managed_values.append(value)
+    cur.execute("SELECT ParamName FROM FieldParams WHERE FieldName = ? ORDER BY ParamName ASC", canonical)
+    for (raw_value,) in cur.fetchall():
+        value = (raw_value or "").strip()
+        if value and value not in managed_values:
+            managed_values.append(value)
     trim_expr = f"LTRIM(RTRIM({column_sql}))"
     usage_counts: Dict[str, int] = {}
     cur.execute(f"SELECT {trim_expr} AS ParamValue, COUNT(*) FROM [dbo].[ITHardware] GROUP BY {trim_expr}")
@@ -2403,17 +1551,11 @@ def _fetch_field_params(conn, field: str) -> List[Dict[str, object]]:
     seen = set()
     for value in managed_values:
         usage = usage_counts.get(value, 0)
-        item = {"value": value, "usage_count": usage, "managed": True}
-        if canonical == "Status":
-            item["is_active"] = status_active_map.get(value, _default_status_is_active(value))
-        items.append(item)
+        items.append({"value": value, "usage_count": usage, "managed": True})
         seen.add(value)
     for value, usage in usage_counts.items():
         if value not in seen:
-            item = {"value": value, "usage_count": usage, "managed": False}
-            if canonical == "Status":
-                item["is_active"] = _default_status_is_active(value)
-            items.append(item)
+            items.append({"value": value, "usage_count": usage, "managed": False})
     items.sort(key=lambda item: (0 if item.get("managed") else 1, item["value"].lower()))
     return items
 
@@ -2537,37 +1679,24 @@ def count_all():
         total = cur.fetchone()[0]
     return {"total": total}
 
-@app.get("/field-parameters", response_model=FieldParametersResponse, response_model_exclude_none=True)
+@app.get("/field-parameters", response_model=FieldParametersResponse)
 def list_field_parameters():
     with get_conn() as conn:
         fields = {field: _fetch_field_params(conn, field) for field in CHOICE_FIELDS}
     return {"fields": fields}
 
 
-@app.get("/field-parameters/{field}", response_model=List[FieldParamItem], response_model_exclude_none=True)
+@app.get("/field-parameters/{field}", response_model=List[FieldParamItem])
 def get_field_parameters(field: str):
     canonical = _ensure_choice_field(field)
     with get_conn() as conn:
         return _fetch_field_params(conn, canonical)
 
 
-@app.post("/field-parameters/{field}", response_model=FieldParamItem, status_code=201, response_model_exclude_none=True)
-def create_field_parameter(
-    field: str,
-    payload: FieldParamCreate,
-    _: UserRecord = Depends(require_admin),
-):
+@app.post("/field-parameters/{field}", response_model=FieldParamItem, status_code=201)
+def create_field_parameter(field: str, payload: FieldParamCreate):
     canonical = _ensure_choice_field(field)
     value = payload.value
-    if canonical == "Country" and len(value) != 2:
-        raise HTTPException(status_code=400, detail={"message": "Country values must be exactly 2 characters."})
-    is_status = canonical == "Status"
-    is_active = None
-    if is_status:
-        if payload.is_active is None:
-            is_active = _default_status_is_active(value)
-        else:
-            is_active = bool(payload.is_active)
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -2577,88 +1706,29 @@ def create_field_parameter(
         )
         if cur.fetchone():
             raise HTTPException(status_code=409, detail="This value already exists for the selected field.")
-        if is_status:
-            cur.execute(
-                "INSERT INTO FieldParams (FieldName, ParamName, IsActive) VALUES (?, ?, ?)",
-                canonical,
-                value,
-                1 if is_active else 0,
-            )
-        else:
-            cur.execute("INSERT INTO FieldParams (FieldName, ParamName) VALUES (?, ?)", canonical, value)
+        cur.execute("INSERT INTO FieldParams (FieldName, ParamName) VALUES (?, ?)", canonical, value)
         conn.commit()
         usage_count = _get_usage_count(conn, canonical, value)
-    item = {"value": value, "usage_count": usage_count, "managed": True}
-    if is_status:
-        item["is_active"] = is_active
-    return item
+    return {"value": value, "usage_count": usage_count, "managed": True}
 
 
-@app.put("/field-parameters/{field}", response_model=FieldParamItem, response_model_exclude_none=True)
-@app.patch("/field-parameters/{field}", response_model=FieldParamItem, response_model_exclude_none=True)
-def update_field_parameter(
-    field: str,
-    payload: FieldParamUpdate,
-    _: UserRecord = Depends(require_admin),
-):
+@app.put("/field-parameters/{field}", response_model=FieldParamItem)
+def update_field_parameter(field: str, payload: FieldParamUpdate):
     canonical = _ensure_choice_field(field)
     original = payload.original
     new_value = payload.value
-    if canonical == "Country" and len(new_value) != 2:
-        raise HTTPException(status_code=400, detail={"message": "Country values must be exactly 2 characters."})
-    is_status = canonical == "Status"
-    same_value = new_value.lower() == original.lower()
-    new_is_active: Optional[bool] = None
     with get_conn() as conn:
         cur = conn.cursor()
-        if is_status:
-            cur.execute(
-                "SELECT ParamName, IsActive FROM FieldParams WHERE FieldName = ? AND UPPER(LTRIM(RTRIM(ParamName))) = UPPER(?)",
-                canonical,
-                original,
-            )
-        else:
-            cur.execute(
-                "SELECT ParamName FROM FieldParams WHERE FieldName = ? AND UPPER(LTRIM(RTRIM(ParamName))) = UPPER(?)",
-                canonical,
-                original,
-            )
+        cur.execute(
+            "SELECT ParamName FROM FieldParams WHERE FieldName = ? AND RTRIM(LTRIM(ParamName)) = ?",
+            canonical,
+            original,
+        )
         row = cur.fetchone()
         if not row:
-            if is_status and payload.is_active is not None and same_value:
-                cur.execute(
-                    "SELECT ParamName, IsActive FROM FieldParams WHERE FieldName = ? AND UPPER(LTRIM(RTRIM(ParamName))) = UPPER(?)",
-                    canonical,
-                    new_value,
-                )
-                row = cur.fetchone()
-                if not row:
-                    new_is_active = bool(payload.is_active)
-                    cur.execute(
-                        "INSERT INTO FieldParams (FieldName, ParamName, IsActive) VALUES (?, ?, ?)",
-                        canonical,
-                        new_value,
-                        1 if new_is_active else 0,
-                    )
-                    column_sql = _field_column_sql(canonical)
-                    trim_expr = f"LTRIM(RTRIM({column_sql}))"
-                    cur.execute(
-                        f"UPDATE [dbo].[ITHardware] SET [If_Deleted] = ? WHERE {trim_expr} = ?",
-                        0 if new_is_active else 1,
-                        new_value.strip(),
-                    )
-                    conn.commit()
-                    usage_count = _get_usage_count(conn, canonical, new_value)
-                    item = {"value": new_value, "usage_count": usage_count, "managed": True, "is_active": new_is_active}
-                    return item
-            if not row:
-                raise HTTPException(status_code=404, detail="The specified value was not found.")
+            raise HTTPException(status_code=404, detail="The specified value was not found.")
         stored_original = row[0]
-        current_is_active = None
-        if is_status:
-            raw_active = row[1]
-            current_is_active = None if raw_active is None else bool(raw_active)
-        if not same_value:
+        if new_value.lower() != original.lower():
             cur.execute(
                 "SELECT 1 FROM FieldParams WHERE FieldName = ? AND UPPER(LTRIM(RTRIM(ParamName))) = UPPER(?)",
                 canonical,
@@ -2667,31 +1737,15 @@ def update_field_parameter(
             existing = cur.fetchone()
             if existing:
                 raise HTTPException(status_code=409, detail="Another parameter already uses this value.")
-        if is_status:
-            requested_is_active = payload.is_active
-            if requested_is_active is None:
-                new_is_active = current_is_active
-                if new_is_active is None:
-                    new_is_active = _default_status_is_active(new_value)
-            else:
-                new_is_active = bool(requested_is_active)
-            cur.execute(
-                "UPDATE FieldParams SET ParamName = ?, IsActive = ? WHERE FieldName = ? AND ParamName = ?",
-                new_value,
-                1 if new_is_active else 0,
-                canonical,
-                stored_original,
-            )
-        else:
-            cur.execute(
-                "UPDATE FieldParams SET ParamName = ? WHERE FieldName = ? AND ParamName = ?",
-                new_value,
-                canonical,
-                stored_original,
-            )
+        cur.execute(
+            "UPDATE FieldParams SET ParamName = ? WHERE FieldName = ? AND ParamName = ?",
+            new_value,
+            canonical,
+            stored_original,
+        )
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Value update failed.")
-        if payload.update_existing and not same_value:
+        if payload.update_existing and new_value.lower() != original.lower():
             column_sql = _field_column_sql(canonical)
             trim_expr = f"LTRIM(RTRIM({column_sql}))"
             cur.execute(
@@ -2699,44 +1753,9 @@ def update_field_parameter(
                 new_value,
                 stored_original.strip(),
             )
-        if is_status and payload.is_active is not None and new_is_active != current_is_active:
-            column_sql = _field_column_sql(canonical)
-            trim_expr = f"LTRIM(RTRIM({column_sql}))"
-            status_value_for_items = (
-                new_value
-                if (payload.update_existing and not same_value)
-                else stored_original.strip()
-            )
-            cur.execute(
-                f"UPDATE [dbo].[ITHardware] SET [If_Deleted] = ? WHERE {trim_expr} = ?",
-                0 if new_is_active else 1,
-                status_value_for_items,
-            )
         conn.commit()
         usage_count = _get_usage_count(conn, canonical, new_value)
-    item = {"value": new_value, "usage_count": usage_count, "managed": True}
-    if is_status:
-        item["is_active"] = new_is_active
-    return item
-
-
-@app.put("/field-parameters/{field}/{value}", response_model=FieldParamItem, response_model_exclude_none=True)
-@app.patch("/field-parameters/{field}/{value}", response_model=FieldParamItem, response_model_exclude_none=True)
-def update_field_parameter_by_value(
-    field: str,
-    value: str,
-    payload: FieldParamPathUpdate,
-    current_user: UserRecord = Depends(require_admin),
-):
-    payload_original = payload.original or value
-    payload_value = payload.value or value
-    merged_payload = FieldParamUpdate(
-        original=payload_original,
-        value=payload_value,
-        update_existing=payload.update_existing,
-        is_active=payload.is_active,
-    )
-    return update_field_parameter(field, merged_payload, current_user)
+    return {"value": new_value, "usage_count": usage_count, "managed": True}
 
 
 @app.delete("/field-parameters/{field}/{value}")
@@ -2745,11 +1764,9 @@ def delete_field_parameter(
     value: str,
     force: bool = Query(False),
     replacement: Optional[str] = Query(None),
-    _: UserRecord = Depends(require_admin),
 ):
     canonical = _ensure_choice_field(field)
     target_value = _normalise_param_value(value)
-    is_status = canonical == "Status"
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -2769,53 +1786,28 @@ def delete_field_parameter(
         if usage_count > 0:
             if replacement:
                 replacement_value = _normalise_param_value(replacement)
-                if is_status:
-                    cur.execute(
-                        "SELECT ParamName, IsActive FROM FieldParams WHERE FieldName = ? AND RTRIM(LTRIM(ParamName)) = ?",
-                        canonical,
-                        replacement_value,
-                    )
-                else:
-                    cur.execute(
-                        "SELECT ParamName FROM FieldParams WHERE FieldName = ? AND RTRIM(LTRIM(ParamName)) = ?",
-                        canonical,
-                        replacement_value,
-                    )
+                cur.execute(
+                    "SELECT ParamName FROM FieldParams WHERE FieldName = ? AND RTRIM(LTRIM(ParamName)) = ?",
+                    canonical,
+                    replacement_value,
+                )
                 rep_row = cur.fetchone()
                 if not rep_row:
                     raise HTTPException(status_code=404, detail="Replacement value is not registered.")
                 applied_replacement = rep_row[0].strip()
-                replacement_active = None
-                if is_status:
-                    raw_active = rep_row[1]
-                    replacement_active = _coerce_status_is_active(raw_active, applied_replacement)
                 if applied_replacement.lower() == stored_value.strip().lower():
                     raise HTTPException(status_code=400, detail="Replacement must be different from the removed value.")
-                if is_status:
-                    cur.execute(
-                        f"UPDATE [dbo].[ITHardware] SET {column_sql} = ?, [If_Deleted] = ? WHERE {trim_expr} = ?",
-                        applied_replacement,
-                        0 if replacement_active else 1,
-                        stored_value.strip(),
-                    )
-                else:
-                    cur.execute(
-                        f"UPDATE [dbo].[ITHardware] SET {column_sql} = ? WHERE {trim_expr} = ?",
-                        applied_replacement,
-                        stored_value.strip(),
-                    )
+                cur.execute(
+                    f"UPDATE [dbo].[ITHardware] SET {column_sql} = ? WHERE {trim_expr} = ?",
+                    applied_replacement,
+                    stored_value.strip(),
+                )
                 affected = cur.rowcount
             elif force:
-                if is_status:
-                    cur.execute(
-                        f"UPDATE [dbo].[ITHardware] SET {column_sql} = NULL, [If_Deleted] = 0 WHERE {trim_expr} = ?",
-                        stored_value.strip(),
-                    )
-                else:
-                    cur.execute(
-                        f"UPDATE [dbo].[ITHardware] SET {column_sql} = NULL WHERE {trim_expr} = ?",
-                        stored_value.strip(),
-                    )
+                cur.execute(
+                    f"UPDATE [dbo].[ITHardware] SET {column_sql} = NULL WHERE {trim_expr} = ?",
+                    stored_value.strip(),
+                )
                 affected = cur.rowcount
             else:
                 raise HTTPException(
@@ -2886,10 +1878,7 @@ class HardwareCreate(BaseModel):
         return v
 
 @app.post("/items", status_code=201)
-def create_item(
-    payload: HardwareCreate,
-    _: UserRecord = Depends(require_editor),
-):
+def create_item(payload: HardwareCreate):
     sql = """
     INSERT INTO [dbo].[ITHardware] (
         Country, Status, Name_Surname, [Identity], Department, Region,
@@ -2909,8 +1898,9 @@ def create_item(
     );
     """
 
+    cleaned, params = _prepare_payload_params(payload)
+
     with get_conn() as conn:
-        cleaned, params = _prepare_payload_params(payload, conn)
         cur = conn.cursor()
         try:
             # Duplicate serial check
@@ -2965,16 +1955,12 @@ def create_item(
 
 
 @app.put("/items/{item_ref}")
-def update_item(
-    item_ref: str,
-    payload: HardwareCreate,
-    _: UserRecord = Depends(require_editor),
-):
+def update_item(item_ref: str, payload: HardwareCreate):
+    cleaned, params = _prepare_payload_params(payload)
     reference = _clean_text(item_ref)
     if not reference:
         raise HTTPException(status_code=400, detail="Invalid item reference.")
     with get_conn() as conn:
-        cleaned, params = _prepare_payload_params(payload, conn)
         cur = conn.cursor()
         target_id: Optional[int] = None
         updated = 0
@@ -3040,10 +2026,7 @@ def update_item(
 
 
 @app.delete("/items/{item_ref}")
-def delete_item(
-    item_ref: str,
-    _: UserRecord = Depends(require_editor),
-):
+def delete_item(item_ref: str):
     reference = _clean_text(item_ref)
     if not reference:
         raise HTTPException(status_code=400, detail="Invalid item reference.")
@@ -3173,40 +2156,7 @@ def rows(
     add_filter("[Capitalization_Date]", "date_lte", capitalization_date_to)
 
     for key, (column_sql, operator) in PARAM_FILTERS.items():
-        if key == "if_deleted":
-            # Active/Inactive inventory pages still send if_deleted=0/1 for compatibility,
-            # but page membership is determined by Status button state (FieldParams.IsActive),
-            # not the potentially stale ITHardware.If_Deleted column.
-            continue
         add_filter(column_sql, operator, filter_values.get(key))
-
-    if if_deleted is not None:
-        # Compatibility mapping:
-        #   if_deleted=0 -> statuses marked active in FieldParams
-        #   if_deleted=1 -> statuses marked inactive in FieldParams
-        desired_status_is_active = 0 if int(if_deleted) == 1 else 1
-        status_trim_expr = "LTRIM(RTRIM(ISNULL([Status], '')))"
-        status_is_active_expr = f"""
-            COALESCE(
-                (
-                    SELECT TOP 1
-                        CASE
-                            WHEN fp.IsActive IS NULL THEN NULL
-                            WHEN fp.IsActive = 1 THEN 1
-                            ELSE 0
-                        END
-                    FROM FieldParams fp
-                    WHERE fp.FieldName = 'Status'
-                      AND UPPER(LTRIM(RTRIM(fp.ParamName))) = UPPER({status_trim_expr})
-                ),
-                CASE
-                    WHEN LOWER({status_trim_expr}) LIKE '%disposed%' THEN 0
-                    ELSE 1
-                END
-            )
-        """
-        where_clauses.append(f"({status_is_active_expr}) = ?")
-        params.append(desired_status_is_active)
 
     search_key = (column or "").strip().lower()
     search_value = (search or "").strip()
