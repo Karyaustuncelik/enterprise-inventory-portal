@@ -1,0 +1,6 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" width="220" height="72" viewBox="0 0 220 72" role="img" aria-labelledby="title desc">
+  <title id="title">Enterprise Logo</title>
+  <desc id="desc">Neutral enterprise brand mark used in the public portfolio build.</desc>
+  <rect x="1.5" y="1.5" width="217" height="69" rx="34.5" fill="none" stroke="#c5162f" stroke-width="3"/>
+  <text x="110" y="45" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="25" font-weight="700" fill="#c5162f">Enterprise</text>
+</svg>

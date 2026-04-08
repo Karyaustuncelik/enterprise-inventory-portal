@@ -1,17 +1,12 @@
-# Python caches and local environments
+﻿# Public repo hygiene
+.env
+*.env
+.venv/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.venv/
-venv/
-.venv_py313_broken/
-
-# Local logs and packaging artifacts
-*.log
-*.zip
-%TEMP%/
-_codex_backup_*/
-_patched_test_main.py
-
-# Editor settings
+node_modules/
+dist/
+.DS_Store
 .vscode/
